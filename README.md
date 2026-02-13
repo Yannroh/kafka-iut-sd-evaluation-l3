@@ -151,4 +151,4 @@ Pointant cette fois-ci sur votre nouveau repository.
 
 ## Notes de conception
 > [!TIP]
-> Ce paragraphe est le vôtre, vous pouvez y consigner vos notes, réflexion voire présenter succintement l'architecture de votre solution
+Je vais d'abors 
