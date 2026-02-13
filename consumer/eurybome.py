@@ -1,120 +1,87 @@
-from kafka import KafkaConsumer
 import json
-import mysql.connector # Nécessite: pip install mysql-connector-python
+import uuid
+import re
+import mysql.connector
+from kafka import KafkaConsumer
 
-# --- 1. CONFIGURATION MARIADB ---
+def split_address(full_address):
+    if not full_address:
+        return 0, ""
+    match = re.match(r"(\d+)\s+(.*)", full_address)
+    if match:
+        return int(match.group(1)), match.group(2)
+    return 0, full_address
+
 try:
-    mariadb_connection = mysql.connector.connect(
-        host='mariadb.rohmer12u-dev.svc.cluster.local',          
-        user='crmuser',              
-        password='kuyWdKFTOgORa48o', 
-        database='crm'  
+    db_target = mysql.connector.connect(
+        host='mygreaterp-db',
+        user='mygreaterpuser',
+        password='mygreaterppw',
+        database='mygreaterp'
     )
-    cursor = mariadb_connection.cursor()
-    print("✅ Connecté à MariaDB avec succès.")
+    cursor_target = db_target.cursor()
 
-
-    print("🛠️ Vérification/Création de la table 'Clients'...")
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS Clients (
-        SourceId INT PRIMARY KEY,
-        nom VARCHAR(255),
-        prenom VARCHAR(255),
-        email VARCHAR(255)
-    )
-    """)
-    mariadb_connection.commit() # On valide la création
-    print("✅ Table 'Clients' prête.")
-
+    
 
 except mysql.connector.Error as err:
-    print(f"❌ Erreur critique connexion MariaDB: {err}")
+    print(f"Database connection error: {err}")
     exit(1)
 
-
-
-sql_upsert = """
-    INSERT INTO Clients (SourceId, nom, prénom, email) 
-    VALUES (%s, %s, %s, %s)
-    ON DUPLICATE KEY UPDATE 
-    nom = VALUES(nom), 
-    prénom = VALUES(prénom), 
-    email = VALUES(email)
-"""
-
-sql_delete = "DELETE FROM Clients WHERE SourceId = %s"
-
-
-# --- 2. CONFIGURATION KAFKA ---
-broker = 'my-kafka.rohmer12u-dev.svc.cluster.local:9092'
-topic = 'dbserver1.inventory.customers'
-
 consumer = KafkaConsumer(
-    topic,
-    bootstrap_servers=[broker],
-    sasl_mechanism='SCRAM-SHA-256',
-    security_protocol='SASL_PLAINTEXT',
-    sasl_plain_username='user1',
-    sasl_plain_password='39PS9jq4ST',  
+    'eurynome.eurynome.customer',
+    bootstrap_servers=['my-kafka.rohmer12u-dev.svc.cluster.local:9092'],
     auto_offset_reset='earliest',
     enable_auto_commit=True,
-    group_id='crm-final-remplissage-v1'
+    group_id='sync-eurynome-erp-group',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
 )
 
-print(f"Listening to topic {topic}")
-
-# --- 3. BOUCLE DE TRAITEMENT ---
 for message in consumer:
-    if message.value:
+    if not message.value:
+        continue
+
+    payload = message.value.get('payload')
+    if not payload:
+        continue
+
+    op = payload.get('op')
+    after = payload.get('after')
+
+    if op in ['c', 'r'] and after:
+        eurynome_id = after.get('id')
+
+        cursor_ref.execute("SELECT mygreaterp_id FROM customers_ref WHERE eurynome_id = %s", (eurynome_id,))
+        if cursor_ref.fetchone():
+            continue
+
+        uuid_contact = str(uuid.uuid4())
+        uuid_address = str(uuid.uuid4())
+        uuid_link = str(uuid.uuid4())
+
+        prenom = after.get('prenom')
+        nom = after.get('nom')
+        
+        raw_address = after.get('adresse_rue', '')
+        num, street = split_address(raw_address)
+        city = after.get('adresse_ville')
+        region = after.get('adresse_region')
+
         try:
-            # 1. Décoder le JSON global
-            data = json.loads(message.value.decode('utf-8'))
+            sql_contact = "INSERT INTO contacts (id, first_name, last_name) VALUES (%s, %s, %s)"
+            cursor_target.execute(sql_contact, (uuid_contact, prenom, nom))
+
+            sql_address = "INSERT INTO addresses (id, number, street, city, state) VALUES (%s, %s, %s, %s, %s)"
+            cursor_target.execute(sql_address, (uuid_address, num, street, city, region))
+
+            sql_link = "INSERT INTO contacts_addresses (id, contact_id, address_id) VALUES (%s, %s, %s)"
+            cursor_target.execute(sql_link, (uuid_link, uuid_contact, uuid_address))
+
+            sql_ref = "INSERT INTO customers_ref (eurynome_id, mygreaterp_id) VALUES (%s, %s)"
+            cursor_ref.execute(sql_ref, (eurynome_id, uuid_contact))
+
+            db_target.commit()
             
-            # 2. Accéder à l'objet 'payload'
-            payload = data.get('payload', data) 
 
-            # Vérification de sécurité si payload est vide (ex: tombstone message)
-            if payload:
-                # 3. Récupérer les états 'before' et 'after'
-                before_data = payload.get('before')
-                after_data = payload.get('after')
-                operation = payload.get('op')  # 'c', 'u', 'd', 'r'
-
-                print("--- Nouveau Changement Détecté ---")
-                print(f"Opération: {operation}")
-
-                # --- CAS 1 : INSERTION / LECTURE / UPDATE (c, r, u) ---
-                # Dans ces cas, on veut que les données dans MariaDB correspondent à 'after_data'
-                if operation in ['c', 'r', 'u']:
-                    if after_data:
-                        # Mapping des champs (Source -> Destination)
-                        s_id = after_data.get('id')          # SourceId
-                        s_nom = after_data.get('last_name')  # nom
-                        s_prenom = after_data.get('first_name') # prénom
-                        s_email = after_data.get('email')    # email
-
-                        # Exécution SQL
-                        cursor.execute(sql_upsert, (s_id, s_nom, s_prenom, s_email))
-                        mariadb_connection.commit()
-                        
-                        if operation == 'u':
-                            print(f"✅ Client mis à jour : {s_prenom} {s_nom}")
-                        else:
-                            print(f"✅ Client créé/synchronisé : {s_prenom} {s_nom}")
-
-                # --- CAS 2 : SUPPRESSION (d) ---
-                elif operation == 'd':
-                    if before_data:
-                        s_id = before_data.get('id')
-                        
-                        # Exécution SQL
-                        cursor.execute(sql_delete, (s_id,))
-                        mariadb_connection.commit()
-                        print(f"🗑️ Client supprimé (ID Source: {s_id})")
-
-        except json.JSONDecodeError:
-            print("Erreur de décodage JSON")
-        except mysql.connector.Error as err:
-            print(f"❌ Erreur SQL lors du traitement : {err}")
-        except AttributeError:
-            print("Format de message inattendu")
+        except mysql.connector.Error as e:
+            db_target.rollback()
+            print(f"SQL Error: {e}")
